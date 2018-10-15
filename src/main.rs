@@ -1,9 +1,6 @@
-//! So where does this comment end up?
-
 extern crate byteorder;
-extern crate nine;
-#[macro_use]
 extern crate failure;
+extern crate nine;
 
 mod server;
 mod utils;
@@ -14,23 +11,20 @@ use nine::de::*;
 use nine::p2000::*;
 use nine::ser::*;
 use server::*;
-use std::cell::RefCell;
-use std::collections::hash_map::HashMap;
-use std::env::args;
-use std::env::var;
+use std::collections::{HashMap, HashSet};
+use std::env::{args, var};
 use std::io::prelude::*;
 use std::io::{self, Cursor};
 use std::os::unix::net::UnixListener;
-use std::rc::{Rc, Weak};
 
 macro_rules! match_message {
     {
         ($self:ident, $serializer:ident, $received_discriminant:ident)
-        $($message_type:ty[$pat:pat] => $func:ident),*
+        $($message_type:ty => $func:ident),*
     } => {
         match $received_discriminant {
             $(
-            $pat => {
+            <$message_type as MessageTypeId>::MSG_TYPE_ID => {
                 let msg: $message_type = $self.read_a().unwrap();
                 let tag = msg.tag;
                 println!("<{:?}", &msg);
@@ -66,9 +60,8 @@ where
     for<'a> &'a Stream: Read + Write,
 {
     stream: Stream,
-    fids: HashMap<u32, Fid>,
-    root: Rc<RefCell<Directory>>,
-    user: Option<String>,
+    session: Option<Session>,
+    file_tree: Option<FileTree>,
 }
 
 impl<Stream> Server<Stream>
@@ -92,6 +85,11 @@ where
         Write::write_all(writer, &[mtype])?;
         Ok(Write::write_all(writer, buf)?)
     }
+
+    fn sess(&mut self) -> &mut Session {
+        self.session.as_mut().unwrap()
+    }
+
     fn handle_client(&mut self) {
         let mut write_buffer = Vec::new();
 
@@ -110,19 +108,19 @@ where
             let mtype: u8 = self.read_a().unwrap();
             match_message! {
                 (self, serializer, mtype)
-                Tversion[Tversion::MSG_TYPE_ID] => version,
-                Tauth[Tauth::MSG_TYPE_ID] => auth,
-                Tattach[Tattach::MSG_TYPE_ID] => attach,
-                Tflush[Tflush::MSG_TYPE_ID] => flush,
-                Twalk[Twalk::MSG_TYPE_ID] => walk,
-                Topen[Topen::MSG_TYPE_ID] => open,
-                Tcreate[Tcreate::MSG_TYPE_ID] => create,
-                Tread[Tread::MSG_TYPE_ID] => read,
-                Twrite[Twrite::MSG_TYPE_ID] => write,
-                Tclunk[Tclunk::MSG_TYPE_ID] => clunk,
-                Tremove[Tremove::MSG_TYPE_ID] => remove,
-                Tstat[Tstat::MSG_TYPE_ID] => stat,
-                Twstat[Twstat::MSG_TYPE_ID] => wstat
+                Tversion => version,
+                Tauth => auth,
+                Tattach => attach,
+                Tflush => flush,
+                Twalk => walk,
+                Topen => open,
+                Tcreate => create,
+                Tread => read,
+                Twrite => write,
+                Tclunk => clunk,
+                Tremove => remove,
+                Tstat => stat,
+                Twstat => wstat
             }
         };
 
@@ -142,158 +140,163 @@ where
     }
 
     fn attach(&mut self, msg: Tattach) -> NineResult<Rattach> {
-        self.fids.insert(
+        // TODO: what if session is already present?
+        // the take().unwrap() will fail but figure out what's
+        // correct here protocol wise
+        let mut fids = HashMap::new();
+        fids.insert(
             msg.fid,
-            Fid {
+            FileHandle {
+                file: 0,
                 open: None,
-                file: FileInTree::Dir(Rc::clone(&self.root)),
             },
         );
-        self.user = Some(msg.uname.into_owned());
-        Ok(Rattach {
-            tag: msg.tag,
-            qid: self.root.borrow().qid(),
-        })
+        let tree = self.file_tree.take().unwrap();
+        let qid = tree.qid(0).unwrap();
+        self.session = Some(Session {
+            fids,
+            tree,
+            user: User {
+                user: msg.uname.into_owned(),
+                group: "TODO_GROUP".into(),
+            },
+        });
+
+        Ok(Rattach { tag: msg.tag, qid })
     }
 
     fn flush(&mut self, msg: Tflush) -> NineResult<Rflush> {
+        // all calls are blocking so this is meaningless to us
         Ok(Rflush { tag: msg.tag })
     }
 
     fn walk(&mut self, msg: Twalk) -> NineResult<Rwalk> {
-        if self.fids.contains_key(&msg.newfid) {
-            rerr("newfid already in use")
-        } else if let Some(current_fid) = self.fids.get(&msg.fid).cloned() {
-            if current_fid.open.is_some() {
-                rerr("cannot walk from an open fid")
-            } else {
-                match msg.wname.len() {
-                    0 => {
-                        self.fids.insert(msg.newfid, current_fid);
-                        Ok(Rwalk {
-                            tag: msg.tag,
-                            wqid: vec![],
-                        })
-                    }
-                    n => {
-                        let mut qids = Vec::with_capacity(n);
-                        for (i, file) in current_fid
-                            .file
-                            .walk(self.root.clone(), msg.wname.iter())
-                            .enumerate()
-                        {
-                            qids.push(file.qid());
-                            if i == n - 1 {
-                                self.fids.insert(msg.newfid, Fid::new(file));
-                            }
-                        }
-
-                        if qids.len() == 0 && n != 1 {
-                            rerr("couldn't walk first element")
-                        } else {
-                            Ok(Rwalk {
-                                tag: msg.tag,
-                                wqid: qids,
-                            })
-                        }
-                    }
-                }
-            }
-        } else {
-            rerr("unknown fid for walk")
-        }
+        Ok(Rwalk {
+            tag: msg.tag,
+            wqid: self
+                .session
+                .as_mut()
+                .unwrap()
+                .walk(msg.fid, msg.newfid, msg.wname.into_iter()),
+        })
     }
 
     fn open(&mut self, msg: Topen) -> NineResult<Ropen> {
-        if let Some(ref mut fid) = self.fids.get_mut(&msg.fid) {
-            let (qid, iounit) = fid.open(self.user.as_ref().unwrap().as_ref(), msg.mode)?;
-            Ok(Ropen {
-                tag: msg.tag,
-                qid,
-                iounit,
-            })
-        } else {
-            rerr("unknown fid")
-        }
+        Ok(Ropen {
+            tag: msg.tag,
+            qid: self.session.as_mut().unwrap().open(msg.fid, msg.mode),
+            iounit: u32::max_value(),
+        })
     }
 
     fn create(&mut self, msg: Tcreate) -> NineResult<Rcreate> {
-        if let Some(ref mut fid) = self.fids.get_mut(&msg.fid) {
-            let file = fid.create(
-                self.user.as_ref().unwrap().as_ref(),
-                msg.name.as_ref(),
-                msg.perm,
-                msg.mode,
-            )?;
-            Ok(Rcreate {
-                tag: msg.tag,
-                qid: file.qid(),
-                iounit: u64::max_value(),
-            })
-        } else {
-            rerr("unknown fid")
-        }
+        Ok(Rcreate {
+            tag: msg.tag,
+            qid: self
+                .session
+                .as_mut()
+                .unwrap()
+                .create(msg.fid, &msg.name, msg.perm, msg.mode),
+            iounit: u32::max_value(),
+        })
     }
 
     fn read(&mut self, msg: Tread) -> NineResult<Rread> {
-        // TODO: move the errors to the file impl and perhaps convert
-        match self.fids.get_mut(&msg.fid) {
-            Some(ref mut fid) => if fid.is_readable(msg.offset) {
-                let mut buf = vec![0; msg.count as usize];
-                let amount = fid.read(msg.offset, buf.as_mut_slice())?;
-                buf.truncate(amount as usize);
-                Ok(Rread {
-                    tag: msg.tag,
-                    data: Data(buf),
-                })
-            } else {
-                rerr("invalid open mode")
-            },
-            _ => rerr("unknown fid"),
+        let mut vec = Vec::with_capacity(msg.count as usize);
+        unsafe {
+            vec.set_len(msg.count as usize);
         }
+        let length = self.sess().read(msg.fid, msg.offset, vec.as_mut_slice());
+        vec.truncate(length as usize);
+
+        Ok(Rread {
+            tag: msg.tag,
+            data: Data(vec),
+        })
     }
 
     fn write(&mut self, msg: Twrite) -> NineResult<Rwrite> {
-        match self.fids.get_mut(&msg.fid) {
-            Some(ref mut fid) => Ok(Rwrite {
-                tag: msg.tag,
-                count: fid.write(
-                    self.user.as_ref().unwrap().as_ref(),
-                    msg.offset,
-                    msg.data.as_ref(),
-                )?,
-            }),
-            _ => rerr("unknown fid"),
-        }
+        Ok(Rwrite {
+            tag: msg.tag,
+            count: self.sess().write(msg.fid, msg.offset, msg.data.as_ref()),
+        })
     }
 
     fn clunk(&mut self, msg: Tclunk) -> NineResult<Rclunk> {
-        self.fids.remove(&msg.fid);
+        self.sess().clunk(msg.fid);
         Ok(Rclunk { tag: msg.tag })
     }
 
-    fn remove(&mut self, _msg: Tremove) -> NineResult<Rremove> {
-        unimplemented!()
+    fn remove(&mut self, msg: Tremove) -> NineResult<Rremove> {
+        self.sess().remove(msg.fid);
+        Ok(Rremove { tag: msg.tag })
     }
 
     fn stat(&mut self, msg: Tstat) -> NineResult<Rstat> {
-        if let Some(ref fid) = self.fids.get(&msg.fid) {
-            Ok(Rstat {
-                tag: msg.tag,
-                stat: fid.file.stat(),
-            })
-        } else {
-            rerr("unknown fid for stat")
-        }
+        Ok(Rstat {
+            tag: msg.tag,
+            stat: self.sess().stat(msg.fid),
+        })
     }
 
     fn wstat(&mut self, msg: Twstat) -> NineResult<Rwstat> {
-        if let Some(ref mut fid) = self.fids.get_mut(&msg.fid) {
-            fid.wstat(self.user.as_ref().unwrap().as_ref(), msg.stat)?;
-            Ok(Rwstat { tag: msg.tag })
-        } else {
-            rerr("unknown fid for wstat")
-        }
+        self.sess().wstat(msg.fid, msg.stat);
+        Ok(Rwstat { tag: msg.tag })
+    }
+}
+
+fn mktree(user: String) -> FileTree {
+    let foo_file = File {
+        content: String::from("Hello (from rust), world!\n").into_bytes(),
+        parent: 0,
+        meta: CommonFileMetaData {
+            version: 0,
+            path: 1,
+            mode: FileMode::OWNER_READ
+                | FileMode::GROUP_READ
+                | FileMode::OTHER_READ
+                | FileMode::OTHER_WRITE,
+            atime: 12,
+            mtime: 13,
+            name: "foo".into(),
+            uid: user.clone().into(),
+            gid: "group".into(),
+            muid: "modifier".into(),
+        },
+        children: None,
+    };
+
+    let mut root_children = HashSet::new();
+    root_children.insert(1);
+
+    let root = File {
+        parent: 0,
+        content: Vec::new(),
+        meta: CommonFileMetaData {
+            version: 0,
+            path: 0,
+            mode: FileMode::DIR
+                | FileMode::OWNER_READ
+                | FileMode::GROUP_READ
+                | FileMode::OTHER_READ
+                | FileMode::OTHER_WRITE,
+            atime: 3,
+            mtime: 4,
+            name: "root".into(),
+            uid: user.into(),
+            gid: "gid".into(),
+            muid: "muid".into(),
+        },
+        children: Some(root_children),
+    };
+
+    let mut all_files = HashMap::new();
+    all_files.insert(0, root);
+    all_files.insert(1, foo_file);
+
+    FileTree {
+        last_path: 1,
+        all_files,
     }
 }
 
@@ -312,58 +315,13 @@ fn main() {
 
     let whoami = var("USER").unwrap();
 
-    let foo_file = Rc::new(RefCell::new(RegularFile {
-        content: String::from("Hello (from rust), world!\n").into_bytes(),
-        parent: Weak::new(),
-        meta: CommonFileMetaData {
-            version: 10,
-            path: 11,
-            mode: FileMode::OWNER_READ
-                | FileMode::GROUP_READ
-                | FileMode::OTHER_READ
-                | FileMode::OTHER_WRITE,
-            atime: 12,
-            mtime: 13,
-            name: "foo".into(),
-            uid: whoami.clone().into(),
-            gid: "group".into(),
-            muid: "modifier".into(),
-        },
-    }));
-    let root = Rc::new(RefCell::new(Directory {
-        parent: None,
-        stat_bytes: Vec::new(),
-        meta: CommonFileMetaData {
-            version: 8,
-            path: 9,
-            mode: FileMode::DIR
-                | FileMode::OWNER_READ
-                | FileMode::GROUP_READ
-                | FileMode::OTHER_READ
-                | FileMode::OTHER_WRITE,
-            atime: 3,
-            mtime: 4,
-            name: "root".into(),
-            uid: whoami.into(),
-            gid: "gid".into(),
-            muid: "muid".into(),
-        },
-        children: HashMap::new(),
-    }));
-
-    foo_file.borrow_mut().parent = Rc::downgrade(&root);
-    root.borrow_mut()
-        .children
-        .insert("foo".into(), FileInTree::File(foo_file));
-
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let mut server = Server {
                     stream,
-                    fids: HashMap::new(),
-                    root: root.clone(),
-                    user: None,
+                    session: None,
+                    file_tree: Some(mktree(whoami.clone())),
                 };
                 server.handle_client();
             }

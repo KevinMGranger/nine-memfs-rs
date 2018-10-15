@@ -1,20 +1,338 @@
+#![allow(unused)]
+
 mod errors;
 pub use self::errors::*;
+use std::collections::HashSet;
 
 use nine::p2000::*;
 use nine::ser::into_bytes;
-use std::cell::RefCell;
 use std::collections::hash_map::HashMap;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::iter::FusedIterator;
-use std::rc::{Rc, Weak};
 use utils::atomic_maybe_change;
 
-pub trait File {
-    fn kind(&self) -> FileKind;
-    fn stat(&self) -> Stat;
+#[derive(Clone)]
+pub struct CommonFileMetaData {
+    pub mode: FileMode,
+    pub version: u32,
+    pub path: u64,
+    pub atime: u32,
+    pub mtime: u32,
+    pub name: String,
+    pub uid: String,
+    pub gid: String,
+    pub muid: String,
+}
+
+// TODO: reconsider / compare / benchmark having paths versus pointers (rcs or Arcs)
+
+pub struct User {
+    pub user: String,
+    pub group: String,
+}
+
+pub struct File {
+    pub meta: CommonFileMetaData,
+    /// byte content for file, stat_bytes for dir
+    pub content: Vec<u8>,
+    pub parent: u64,
+    /// a set of child paths
+    /// todo: if this doesn't allocate until use, can we just
+    /// get rid of the Option and say "no touchie" ?
+    pub children: Option<HashSet<u64>>,
+}
+
+impl File {
+    fn new(meta: CommonFileMetaData, parent: u64) -> File {
+        let dir = meta.mode.contains(FileMode::DIR);
+        File {
+            meta,
+            content: Vec::new(),
+            parent,
+            children: if dir { Some(HashSet::new()) } else { None },
+        }
+    }
+
+    fn is_dir(&self) -> bool {
+        self.children.is_some()
+    }
+
+    fn is_file(&self) -> bool {
+        !self.is_dir()
+    }
+
     fn qid(&self) -> Qid {
-        self.stat().qid
+        Qid {
+            file_type: self.meta.mode.into(),
+            version: self.meta.version,
+            path: self.meta.path,
+        }
+    }
+
+    fn stat(&self) -> Stat {
+        Stat {
+            type_: 1,
+            dev: 2,
+            qid: Qid {
+                file_type: self.meta.mode.into(),
+                version: self.meta.version,
+                path: self.meta.path,
+            },
+            mode: self.meta.mode,
+            atime: self.meta.atime,
+            mtime: self.meta.mtime,
+            length: if self.is_file() {
+                self.content.len() as u64
+            } else {
+                0
+            },
+            name: self.meta.name.clone().into(),
+            uid: self.meta.uid.clone().into(),
+            gid: self.meta.gid.clone().into(),
+            muid: self.meta.muid.clone().into(),
+        }
+    }
+
+    // TODO: exec
+    fn open(&mut self, user: &User, mode: OpenMode) -> NineResult<()> {
+        // TODO: group
+        let user = &user.user;
+
+        if self.is_dir() {
+            if mode.is_writable() {
+                return rerr("can't write to a directory");
+            }
+            if mode.contains(OpenMode::TRUNC) {
+                return rerr("can't truncate a directory");
+            }
+            if mode.contains(OpenMode::CLOSE) {
+                return rerr("can't remove dir on close");
+            }
+
+            let stat = self.stat();
+            if mode.is_readable() {
+                if stat.readable_for(user) {
+                    Ok(())
+                } else {
+                    rerr("not readable")
+                }
+            } else {
+                unreachable!()
+            }
+        } else {
+            let stat = self.stat();
+            if mode.is_readable() && !stat.readable_for(user) {
+                return rerr("file not readable");
+            }
+            if mode.is_writable() {
+                if !stat.writable_for(user) {
+                    return rerr("file not writable");
+                }
+                if mode.contains(OpenMode::TRUNC) {
+                    self.meta.muid = user.to_string();
+                    self.content.clear();
+                }
+            }
+
+            Ok(())
+        }
+    }
+
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> u32 {
+        let mut cursor = Cursor::new(&self.content);
+        cursor.seek(SeekFrom::Start(offset)).unwrap();
+        cursor.read(buf).unwrap() as u32
+    }
+
+    fn write(&mut self, user: &str, offset: u64, buf: &[u8]) -> Option<(u32, bool)> {
+        if self.is_dir() {
+            return None;
+        }
+
+        let mut should_invalidate = false;
+        if self.meta.muid != user {
+            should_invalidate = true;
+            self.meta.muid = user.to_string();
+        }
+        let start_len = self.content.len();
+
+        let amt = {
+            let mut cursor = Cursor::new(&mut self.content);
+            cursor.seek(SeekFrom::Start(offset)).unwrap();
+            cursor.write(buf).unwrap() as u32
+        };
+
+        should_invalidate = start_len != self.content.len();
+
+        Some((amt, should_invalidate))
+    }
+
+    fn children_of<'a>(
+        &'a self,
+        all_files: &'a HashMap<u64, File>,
+    ) -> impl Iterator<Item = &'a File> {
+        self.children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(move |x| all_files.get(x).unwrap())
+    }
+
+    fn walk<'a, S, I>(
+        &'a self,
+        all_files: &'a HashMap<u64, File>,
+        wname: I,
+    ) -> impl FusedIterator<Item = &'a File>
+    where
+        S: AsRef<str>,
+        I: Iterator<Item = S>,
+    {
+        Walker {
+            current_file: self,
+            file_tree: all_files,
+            wname: wname.fuse(),
+        }.fuse()
+    }
+}
+
+/// Root is always 0.
+pub struct FileTree {
+    pub last_path: u64,
+    pub all_files: HashMap<u64, File>,
+}
+
+impl FileTree {
+    pub fn stat(&self, path: u64) -> Option<Stat> {
+        self.all_files.get(&path).map(|x| x.stat())
+    }
+
+    pub fn qid(&self, path: u64) -> Option<Qid> {
+        self.all_files.get(&path).map(|x| x.qid())
+    }
+
+    pub fn open(&mut self, path: u64, user: &User, mode: OpenMode) -> NineResult<&File> {
+        let mut file = self.all_files.get_mut(&path).unwrap();
+
+        file.open(user, mode).unwrap();
+
+        Ok(file)
+    }
+
+    pub fn create(
+        &mut self,
+        path: u64,
+        user: impl Into<String> + AsRef<str>,
+        name: impl Into<String> + AsRef<str>,
+        perm: FileMode,
+        _mode: OpenMode,
+    ) -> NineResult<&File> {
+        let new_file = {
+            let file = self.all_files.get(&path).unwrap();
+            if file.is_file() {
+                return rerr("can't create under a file");
+            }
+
+            if file
+                .children
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|x| self.all_files.get(x).unwrap())
+                .any(|x| name.as_ref() == x.meta.name)
+            {
+                return rerr("a file with that name already exists");
+            }
+
+            // TODO: the fancy permissions stuff
+
+            self.last_path += 1;
+
+            let name = name.into();
+            let uid = user.into();
+            let muid = uid.clone();
+            let gid = "some_group".into(); // TODO
+
+            let meta = CommonFileMetaData {
+                mode: perm,
+                version: 0,
+                path: self.last_path,
+                atime: 0, // TODO
+                mtime: 0, // TODO
+                name,
+                uid,
+                muid,
+                gid,
+            };
+
+            File::new(meta, file.meta.path)
+        };
+
+        let new_path = new_file.meta.path;
+
+        {
+            let file = self.all_files.get_mut(&path).unwrap();
+
+            file.children.as_mut().unwrap().insert(new_path);
+            file.content.clear();
+        }
+
+        self.all_files.insert(new_path, new_file);
+
+        Ok(self.all_files.get(&new_path).unwrap())
+    }
+
+    fn read(&mut self, path: u64, offset: u64, buf: &mut [u8]) -> NineResult<u32> {
+        let maybe_new_content = {
+            let file = self.all_files.get(&path).unwrap();
+
+            if let Some(children) = file.children.as_ref() {
+                if children.len() != 0 && file.content.len() == 0 {
+                    let mut content = Vec::new();
+                    for stat in children
+                        .iter()
+                        .map(|x| self.all_files.get(x).unwrap().stat())
+                    {
+                        // TODO: directly into the vec
+                        content.extend(into_bytes(&stat));
+                    }
+
+                    Some(content)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let file = self.all_files.get_mut(&path).unwrap();
+
+        if let Some(content) = maybe_new_content {
+            file.content = content;
+        }
+
+        Ok(file.read(offset, buf))
+    }
+
+    fn write(&mut self, path: u64, user: &str, offset: u64, buf: &[u8]) -> NineResult<u32> {
+        let ((amt, should_invalidate), parent) = {
+            let file = self.all_files.get_mut(&path).unwrap();
+            let res = file.write(user, offset, buf);
+            if res.is_none() {
+                return rerr("can't write to a directory");
+            }
+            (res.unwrap(), file.parent)
+        };
+
+        if should_invalidate {
+            self.invalidate(parent);
+        }
+
+        Ok(amt)
+    }
+
+    fn invalidate(&mut self, path: u64) {
+        self.all_files.get_mut(&path).unwrap().content.clear();
     }
 
     /// # Changable fields
@@ -30,491 +348,153 @@ pub trait File {
     /// file server; see Plan 9’s fsconfig(8).)"
     ///
     /// wat
-    fn wstat(&mut self, user: &str, wstat: Stat) -> NineResult<()>;
-
-    fn create(
-        &mut self,
-        user: &str,
-        name: &str,
-        perm: FileMode,
-        mode: OpenMode,
-    ) -> NineResult<FileInTree>;
-    fn open(&mut self, user: &str, mode: OpenMode) -> NineResult<(Qid, u32)>;
-
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> NineResult<u64>;
-
-    // TODO: move these to dir, make them not defaultly implemented
-    #[allow(unused_variables)]
-    fn write(&mut self, user: &str, offset: u64, buf: &[u8]) -> NineResult<u32> {
-        rerr("not writable")
-    }
-    #[allow(unused_variables)]
-    fn truncate(&mut self, user: &str) -> NineResult<()> {
-        rerr("not truncatable")
-    }
-}
-
-#[derive(Clone)]
-pub struct CommonFileMetaData {
-    pub mode: FileMode,
-    pub version: u32,
-    pub path: u64,
-    pub atime: u32,
-    pub mtime: u32,
-    pub name: CowStr, // should this just be in the hashmap? make the conversion from the entry?
-    pub uid: CowStr,
-    pub gid: CowStr,
-    pub muid: CowStr,
-}
-
-pub struct RegularFile {
-    pub content: Vec<u8>,
-    pub parent: Weak<RefCell<Directory>>, // TODO: is this really proper? read paper on canonicalization
-    pub meta: CommonFileMetaData,
-}
-
-impl<'a> From<&'a RegularFile> for Stat {
-    fn from(file: &'a RegularFile) -> Self {
-        Stat {
-            type_: 1,
-            dev: 2,
-            qid: Qid {
-                file_type: file.meta.mode.into(),
-                version: file.meta.version,
-                path: file.meta.path,
-            },
-            mode: file.meta.mode,
-            atime: file.meta.atime,
-            mtime: file.meta.mtime,
-            length: file.content.len() as u64,
-            name: file.meta.name.clone(),
-            uid: file.meta.uid.clone(),
-            gid: file.meta.gid.clone(),
-            muid: file.meta.muid.clone(),
-        }
-    }
-}
-
-impl File for RegularFile {
-    fn kind(&self) -> FileKind {
-        FileKind::File
-    }
-    fn stat(&self) -> Stat {
-        self.into()
-    }
-
-    // TODO: this should maybe be abstracted with a change builder object, and a policy trait.
-    fn wstat(&mut self, user: &str, wstat: Stat) -> NineResult<()> {
-        if let Some(new_meta) = {
-            let is_owner = user == self.meta.uid;
-            let my_name = self.meta.name.as_ref();
-            let parent = &self.parent;
-            let content = &mut self.content;
-            atomic_maybe_change(&self.meta, |new_meta| {
-                if wstat.mode.bits() != u32::max_value() {
-                    if !is_owner {
-                        return rerr("only the owner or group leader can chang a file's mode");
-                    }
-                    if wstat.mode.contains(FileMode::DIR) {
-                        return rerr("can't change dir bit");
-                    }
-
-                    new_meta.to_mut().mode = wstat.mode;
-                }
-
-                if wstat.mtime != u32::max_value() {
-                    new_meta.to_mut().mtime = wstat.mtime;
-                }
-
-                // TODO: gid
-
-                if wstat.name.len() != 0 {
-                    if let Some(parent) = parent.upgrade() {
-                        let mut parent = parent.borrow_mut();
-                        if parent.children.contains_key(wstat.name.as_ref()) {
-                            return rerr("can't rename to existing file");
+    fn wstat(&mut self, path: u64, user: &str, wstat: Stat) -> NineResult<()> {
+        let changing_length = wstat.length != u64::max_value();
+        let (should_invalidate, parent) = {
+            let file = self.all_files.get_mut(&path).unwrap();
+            let parent = file.parent;
+            let maybe_new_meta = {
+                let is_owner = user == file.meta.uid;
+                let is_dir = file.is_dir();
+                let old_meta = &file.meta;
+                let content = &mut file.content;
+                atomic_maybe_change(old_meta, |new_meta| {
+                    if wstat.mode.bits() != u32::max_value() {
+                        if !is_owner {
+                            return rerr("only the owner or group leader can chang a file's mode");
                         }
-                        if let Some(file) = parent.children.remove(my_name) {
-                            parent.children.insert(wstat.name.clone().into(), file);
-                            new_meta.to_mut().name = wstat.name.into();
-                        // TODO: update parent mtime
-                        } else {
-                            return Err(ServerFail::ImmediateFatal(format_err!(
-                                "file's name ({}) isn't present in parent",
-                                my_name
-                            )));
+                        if wstat.mode.contains(FileMode::DIR) ^ is_dir {
+                            return rerr("can't change dir bit");
                         }
-                    } else {
-                        return Err(ServerFail::ImmediateFatal(format_err!(
-                            "file {} was orphaned in rc",
-                            my_name
-                        )));
-                    }
-                }
 
-                if wstat.length != u64::max_value() {
-                    if wstat.length as usize != content.len() {
+                        new_meta.to_mut().mode = wstat.mode;
+                    }
+
+                    if wstat.mtime != u32::max_value() {
+                        new_meta.to_mut().mtime = wstat.mtime;
+                    }
+
+                    // TODO: gid
+
+                    if wstat.name.len() != 0 {
+                        new_meta.to_mut().name = wstat.name.into_owned()
+                    }
+
+                    if is_dir && wstat.length != 0 && changing_length {
+                        return rerr("can't set length of dir");
+                    }
+                    if !is_dir && changing_length {
                         content.resize(wstat.length as usize, 0);
                     }
-                }
 
-                Ok(())
-            })?
-        } {
-            self.meta = new_meta;
-        }
+                    Ok(())
+                })?
+            };
 
-        Ok(())
-    }
-
-    fn create(
-        &mut self,
-        _user: &str,
-        _name: &str,
-        _perm: FileMode,
-        _mode: OpenMode,
-    ) -> NineResult<FileInTree> {
-        rerr("cannot create a child of a file")
-    }
-    //TODO: exec
-    fn open(&mut self, user: &str, mode: OpenMode) -> NineResult<(Qid, u32)> {
-        let stat = self.stat();
-        if mode.is_readable() && !stat.readable_for(user) {
-            return rerr("file not readable");
-        }
-        if mode.is_writable() {
-            if !stat.writable_for(user) {
-                return rerr("file not writable");
-            }
-            if mode.contains(OpenMode::TRUNC) {
-                self.truncate(user)?;
-            }
-        }
-
-        Ok((stat.qid, u32::max_value()))
-    }
-
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> NineResult<u64> {
-        let mut cursor = Cursor::new(&self.content);
-        cursor.seek(SeekFrom::Start(offset)).unwrap();
-        Ok(cursor.read(buf).unwrap() as u64)
-    }
-
-    fn write(&mut self, user: &str, offset: u64, buf: &[u8]) -> NineResult<u32> {
-        self.meta.muid = user.to_string().into();
-        let mut cursor = Cursor::new(&mut self.content);
-        cursor.seek(SeekFrom::Start(offset)).unwrap();
-        Ok(cursor.write(buf).unwrap() as u32)
-    }
-    fn truncate(&mut self, user: &str) -> NineResult<()> {
-        self.meta.muid = user.to_string().into();
-        Ok(self.content.truncate(0))
-    }
-}
-
-pub struct Directory {
-    pub children: HashMap<String, FileInTree>,
-    pub parent: Option<Weak<RefCell<Directory>>>, // TODO: is this really proper? read paper on canonicalization
-    pub meta: CommonFileMetaData,
-    pub stat_bytes: Vec<u8>,
-}
-
-impl<'a> From<&'a Directory> for Stat {
-    fn from(file: &'a Directory) -> Stat {
-        Stat {
-            type_: 1,
-            dev: 2,
-            qid: Qid {
-                file_type: file.meta.mode.into(),
-                version: file.meta.version,
-                path: file.meta.path,
-            },
-            mode: file.meta.mode,
-            atime: file.meta.atime,
-            mtime: file.meta.mtime,
-            length: 0,
-            name: file.meta.name.clone(),
-            uid: file.meta.uid.clone(),
-            gid: file.meta.gid.clone(),
-            muid: file.meta.muid.clone(),
-        }
-    }
-}
-
-impl File for Directory {
-    fn kind(&self) -> FileKind {
-        FileKind::Dir
-    }
-    fn stat(&self) -> Stat {
-        self.into()
-    }
-
-    fn create(
-        &mut self,
-        user: &str,
-        name: &str,
-        perm: FileMode,
-        _mode: OpenMode,
-    ) -> NineResult<FileInTree> {
-        if self.children.contains_key(name) {
-            return rerr("a file with that name already exists");
-        }
-
-        if !self.stat().writable_for(user) {
-            return rerr("no write permission for this dir");
-        }
-
-        // TODO: the fancy permissions stuff
-
-        let meta = CommonFileMetaData {
-            mode: perm,
-            version: 0,
-            path: 0,  // TODO
-            atime: 0, // TODO
-            mtime: 0, // TODO
-            name: name.to_string().into(),
-            uid: user.to_string().into(),
-            gid: "some_group".into(), // TODO
-            muid: user.to_string().into(),
-        };
-        let file = if perm.contains(FileMode::DIR) {
-            FileInTree::Dir(Rc::new(RefCell::new(Directory {
-                children: Default::default(),
-                parent: None,
-                stat_bytes: Default::default(),
-                meta,
-            })))
-        } else {
-            FileInTree::File(Rc::new(RefCell::new(RegularFile {
-                content: Default::default(),
-                parent: Weak::new(),
-                meta,
-            })))
-        };
-
-        self.children.insert(name.to_string(), file.clone());
-        self.stat_bytes.truncate(0);
-
-        Ok(file)
-    }
-    fn wstat(&mut self, user: &str, wstat: Stat) -> NineResult<()> {
-        if let Some(new_meta) = {
-            let is_owner = user == self.meta.uid;
-            let my_name = self.meta.name.as_ref();
-            let parent = &self.parent;
-            atomic_maybe_change(&self.meta, |new_meta| {
-                if wstat.mode.bits() != u32::max_value() {
-                    if !is_owner {
-                        return rerr("only the owner or group leader can chang a file's mode");
-                    }
-                    if !wstat.mode.contains(FileMode::DIR) {
-                        return rerr("can't change dir bit");
-                    }
-
-                    new_meta.to_mut().mode = wstat.mode;
-                }
-
-                if wstat.mtime != u32::max_value() {
-                    new_meta.to_mut().mtime = wstat.mtime;
-                }
-
-                // TODO: gid
-
-                if wstat.length != u64::max_value() && wstat.length != 0 {
-                    return rerr("can't resize a dir");
-                }
-
-                if wstat.name.len() != 0 {
-                    if let Some(parent) = parent {
-                        if let Some(parent) = parent.upgrade() {
-                            let mut parent = parent.borrow_mut();
-                            if parent.children.contains_key(wstat.name.as_ref()) {
-                                return rerr("can't rename to existing file");
-                            }
-                            if let Some(file) = parent.children.remove(my_name) {
-                                parent.children.insert(wstat.name.clone().into(), file);
-                                new_meta.to_mut().name = wstat.name.into();
-                                parent.stat_bytes.clear(); // TODO: what if there's a multi-message read in progress? How is that handled?
-                                                           // TODO: update parent mtime
-                            } else {
-                                return Err(ServerFail::ImmediateFatal(format_err!(
-                                    "dir's name ({}) isn't present in parent",
-                                    my_name
-                                )));
-                            }
-                        } else {
-                            return Err(ServerFail::ImmediateFatal(format_err!(
-                                "dir {} was orphaned in rc",
-                                my_name
-                            )));
-                        }
-                    } else {
-                        return rerr("can't rename root file"); // or can you?
-                    }
-                }
-
-                Ok(())
-            })?
-        } {
-            self.meta = new_meta;
-        }
-
-        Ok(())
-    }
-    fn open(&mut self, user: &str, mode: OpenMode) -> NineResult<(Qid, u32)> {
-        if mode.is_writable() {
-            return rerr("can't write to a directory");
-        }
-        if mode.contains(OpenMode::TRUNC) {
-            return rerr("can't truncate a directory");
-        }
-        if mode.contains(OpenMode::CLOSE) {
-            return rerr("can't remove dir on close");
-        }
-
-        let stat = self.stat();
-        if mode.is_readable() {
-            if stat.readable_for(user) {
-                Ok((stat.qid, u32::max_value()))
+            if let Some(new_meta) = maybe_new_meta {
+                file.meta = new_meta;
+                (true, parent)
+            } else if changing_length {
+                (true, parent)
             } else {
-                rerr("not readable")
+                (false, parent)
             }
-        } else {
-            unreachable!()
+        };
+
+        if should_invalidate {
+            self.invalidate(parent)
         }
+        Ok(())
     }
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> NineResult<u64> {
-        if self.stat_bytes.len() == 0 {
-            // make the bytes here
-            for bytes in self.children
-                .values()
-                .map(File::stat)
-                .map(|x| into_bytes(&x))
-            {
-                self.stat_bytes.extend(bytes);
+
+    fn remove(&mut self, path: u64, user: &User) {
+        {
+            let parent = self
+                .all_files
+                .get(&path)
+                .expect("unknown path for file to remove")
+                .parent;
+            let parent = self.all_files.get_mut(&parent);
+
+            if let Some(parent) = parent {
+                parent.children.as_mut().expect("parent was not a dir").remove(&path);
+            } else {
+                panic!("file was orphaned");
             }
         }
-        let mut cursor = Cursor::new(&self.stat_bytes);
-        cursor.seek(SeekFrom::Start(offset)).unwrap();
-        Ok(cursor.read(buf).unwrap() as u64)
+
+        self.all_files.remove(&path);
     }
-}
 
-pub enum FileKind {
-    File,
-    Dir,
-}
+    fn children_of(&self, path: &u64) -> impl Iterator<Item = &File> {
+        self.all_files
+            .get(&path)
+            .unwrap()
+            .children_of(&self.all_files)
+    }
 
-#[derive(Clone)]
-pub enum FileInTree {
-    File(Rc<RefCell<RegularFile>>),
-    Dir(Rc<RefCell<Directory>>),
-}
-
-impl FileInTree {
-    // TODO: permissions check
-    pub fn walk<S, I>(
-        self,
-        root: Rc<RefCell<Directory>>,
-        wname: I,
-    ) -> impl Iterator<Item = FileInTree>
+    fn walk<S, I>(&self, wname: I) -> impl FusedIterator<Item = &File>
     where
         S: AsRef<str>,
-        I: Iterator<Item = S>,
+        I: IntoIterator<Item = S>,
+    {
+        self.walk_from(0, wname)
+    }
+
+    fn walk_from<S, I>(&self, path: u64, wname: I) -> impl FusedIterator<Item = &File>
+    where
+        S: AsRef<str>,
+        I: IntoIterator<Item = S>,
     {
         Walker {
-            current_file: self,
-            root: root,
-            wname: wname.fuse(),
-        }
-    }
-
-    pub fn ptr_eq(this: &FileInTree, other: &FileInTree) -> bool {
-        use self::FileInTree::*;
-        match (this, other) {
-            (File(ref this), File(ref other)) => Rc::ptr_eq(this, other),
-            (Dir(ref this), Dir(ref other)) => Rc::ptr_eq(this, other),
-            _ => false,
-        }
-    }
-    pub fn is_writable(&self) -> NineResult<()> {
-        match self.kind() {
-            FileKind::File => Ok(()),
-            FileKind::Dir => rerr("directories are not writable"),
-        }
-    }
-
-    fn set_parent(&mut self, parent: Weak<RefCell<Directory>>) {
-        match self {
-            FileInTree::Dir(ref mut x) => x.borrow_mut().parent = Some(parent),
-            FileInTree::File(ref mut x) => x.borrow_mut().parent = parent,
-        }
+            current_file: self.all_files.get(&path).unwrap(),
+            file_tree: &self.all_files,
+            wname: wname.into_iter().fuse(),
+        }.fuse()
     }
 }
 
-impl File for FileInTree {
-    fn kind(&self) -> FileKind {
-        match self {
-            FileInTree::File(_) => FileKind::File,
-            FileInTree::Dir(_) => FileKind::Dir,
-        }
-    }
+struct Walker<'a, S, I>
+where
+    S: AsRef<str>,
+    I: FusedIterator<Item = S>,
+{
+    current_file: &'a File,
+    file_tree: &'a HashMap<u64, File>,
+    wname: I,
+}
 
-    fn stat(&self) -> Stat {
-        match self {
-            FileInTree::File(x) => x.borrow().stat(),
-            FileInTree::Dir(x) => x.borrow().stat(),
+// TODO: this is only correct if fused. Maybe hide the impl in a method on File
+// and fuse it ourselves
+impl<'a, S, I> Iterator for Walker<'a, S, I>
+where
+    S: AsRef<str>,
+    I: FusedIterator<Item = S>,
+{
+    type Item = &'a File;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_file.is_file() {
+            return None;
         }
-    }
-
-    fn wstat(&mut self, user: &str, wstat: Stat) -> NineResult<()> {
-        match self {
-            FileInTree::File(ref mut x) => x.borrow_mut().wstat(user, wstat),
-            FileInTree::Dir(ref mut x) => x.borrow_mut().wstat(user, wstat),
-        }
-    }
-
-    fn open(&mut self, user: &str, mode: OpenMode) -> NineResult<(Qid, u32)> {
-        match self {
-            FileInTree::File(ref mut x) => x.borrow_mut().open(user, mode),
-            FileInTree::Dir(ref mut x) => x.borrow_mut().open(user, mode),
-        }
-    }
-
-    fn create(
-        &mut self,
-        user: &str,
-        name: &str,
-        perm: FileMode,
-        mode: OpenMode,
-    ) -> NineResult<FileInTree> {
-        match self {
-            FileInTree::File(ref mut x) => x.borrow_mut().create(user, name, perm, mode),
-            FileInTree::Dir(ref mut x) => {
-                let mut file = x.borrow_mut().create(user, name, perm, mode)?;
-                file.set_parent(Rc::downgrade(x));
-                Ok(file)
+        match self.wname.next().as_ref().map(|x| x.as_ref()) {
+            None => None,
+            Some(name) if name == ".." => {
+                if self.current_file.meta.path != 0 {
+                    self.current_file = self.file_tree.get(&self.current_file.parent).unwrap();
+                }
+                Some(self.current_file)
             }
-        }
-    }
-
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> NineResult<u64> {
-        match self {
-            FileInTree::File(ref mut x) => x.borrow_mut().read(offset, buf),
-            FileInTree::Dir(ref mut x) => x.borrow_mut().read(offset, buf),
-        }
-    }
-
-    fn write(&mut self, user: &str, offset: u64, buf: &[u8]) -> NineResult<u32> {
-        match self {
-            FileInTree::File(ref mut x) => x.borrow_mut().write(user, offset, buf),
-            FileInTree::Dir(ref mut x) => x.borrow_mut().write(user, offset, buf),
-        }
-    }
-    fn truncate(&mut self, user: &str) -> NineResult<()> {
-        match self {
-            FileInTree::File(ref mut x) => x.borrow_mut().truncate(user),
-            FileInTree::Dir(ref mut x) => x.borrow_mut().truncate(user),
+            Some(name) => match self
+                .current_file
+                .children_of(self.file_tree)
+                .find(|file| file.meta.name == name)
+            {
+                None => None,
+                Some(file) => {
+                    self.current_file = file;
+                    Some(self.current_file)
+                }
+            },
         }
     }
 }
@@ -526,165 +506,224 @@ pub struct OpenView {
 }
 
 #[derive(Clone)]
-pub struct Fid {
-    pub file: FileInTree,
+pub struct FileHandle {
+    pub file: u64,
     pub open: Option<OpenView>,
 }
 
-impl Fid {
-    pub fn new(file: FileInTree) -> Self {
-        Fid { file, open: None }
+impl FileHandle {
+    pub fn new(file: u64) -> Self {
+        FileHandle { file, open: None }
     }
 
-    pub fn is_readable(&self, offset: u64) -> bool {
+    pub fn is_readable(&self, offset: u64, file_tree: &HashMap<u64, File>) -> bool {
         match self.open {
             None => false,
             Some(ref view) => if view.mode.is_readable() {
-                match self.file.kind() {
-                    FileKind::Dir if view.last_offset == offset || offset == 0 => true,
-                    FileKind::File => true,
-                    _ => false,
-                }
+                let file = file_tree.get(&self.file).unwrap();
+                file.is_file() || (view.last_offset == offset || offset == 0)
             } else {
                 false
             },
         }
     }
 
-    pub fn is_writable(&self) -> NineResult<()> {
-        self.file.is_writable()?;
+    pub fn is_writable(&self, file_tree: &HashMap<u64, File>) -> bool {
         if let Some(ref view) = self.open {
             if view.mode.is_writable() {
-                Ok(())
+                true
             } else {
-                rerr("fid is not open for writing")
+                false
             }
         } else {
-            rerr("fid is not open")
+            false
         }
     }
-}
 
-struct Walker<S, I>
-where
-    S: AsRef<str>,
-    I: FusedIterator<Item = S>,
-{
-    current_file: FileInTree,
-    root: Rc<RefCell<Directory>>,
-    wname: I,
-}
-
-impl<S, I> Iterator for Walker<S, I>
-where
-    S: AsRef<str>,
-    I: FusedIterator<Item = S>,
-{
-    type Item = FileInTree;
-    fn next(&mut self) -> Option<Self::Item> {
-        use FileInTree::*;
-        if let Some(name) = self.wname.next() {
-            let name = name.as_ref();
-            let (new_cur, ret) = match self.current_file {
-                Dir(ref dir) => {
-                    let bdir = dir.borrow();
-                    if name == ".." {
-                        if let Some(ref parent) = bdir.parent {
-                            (
-                                Some(FileInTree::Dir(parent.upgrade().unwrap().clone())),
-                                Some(self.current_file.clone()),
-                            )
-                        } else if Rc::ptr_eq(&dir, &self.root) {
-                            (None, Some(self.current_file.clone()))
-                        } else {
-                            (None, None)
-                        }
-                    } else if let Some(child) = bdir.children.get(name) {
-                        (Some(child.clone()), Some(child.clone()))
-                    } else {
-                        (None, None)
-                    }
-                }
-                File(_) => (None, None),
-            };
-            if let Some(new_cur) = new_cur {
-                self.current_file = new_cur;
-            }
-            ret
-        } else {
-            None
-        }
-    }
-}
-
-impl File for Fid {
-    fn kind(&self) -> FileKind {
-        self.file.kind()
-    }
-    fn stat(&self) -> Stat {
-        self.file.stat()
-    }
-
-    fn wstat(&mut self, user: &str, wstat: Stat) -> NineResult<()> {
-        self.file.wstat(user, wstat)
-    }
-
-    fn create(
+    fn create<'a>(
         &mut self,
         user: &str,
         name: &str,
         perm: FileMode,
         mode: OpenMode,
-    ) -> NineResult<FileInTree> {
+        tree: &'a mut FileTree,
+    ) -> NineResult<&'a File> {
         if self.open.is_some() {
-            return rerr("cannot create on an open fid")
+            return rerr("cannot create on an open fid");
         }
 
-        self.file.create(user, name, perm, mode)
+        let res = tree.create(self.file, user, name, perm, mode);
+
+        if let Ok(file) = &res {
+            self.file = file.meta.path;
+            self.open = Some(OpenView {
+                mode,
+                last_offset: 0,
+            });
+        }
+
+        res
     }
 
-    /// Changes open mode of file
-    fn open(&mut self, user: &str, mode: OpenMode) -> NineResult<(Qid, u32)> {
+    fn open<'a>(
+        &mut self,
+        user: &User,
+        mode: OpenMode,
+        tree: &'a mut HashMap<u64, File>,
+    ) -> NineResult<&'a File> {
         if self.open.is_some() {
             return rerr("file is already open");
         }
 
-        let res = self.file.open(user, mode)?;
+        let mut file = tree.get_mut(&self.file).unwrap();
+
+        file.open(user, mode).unwrap();
+
         self.open = Some(OpenView {
-            mode: mode,
+            mode,
             last_offset: 0,
         });
 
-        Ok(res)
+        Ok(file)
+    }
+}
+
+pub struct Session {
+    pub fids: HashMap<u32, FileHandle>,
+    pub tree: FileTree,
+    pub user: User,
+}
+
+impl Session {
+    pub fn walk<S, I>(&mut self, fid: u32, newfid: u32, wname: I) -> Vec<Qid>
+    where
+        S: AsRef<str>,
+        I: IntoIterator<Item = S> + ExactSizeIterator,
+    {
+        let nwname = wname.len();
+        let path = self.fids.get(&fid).unwrap().file;
+        let wfiles: Vec<Qid> = self
+            .tree
+            .walk_from(path, wname)
+            .map(|x| x.qid())
+            .collect();
+
+        if wfiles.len() == nwname {
+            self.fids.insert(
+                newfid,
+                FileHandle {
+                    file: if nwname != 0 { wfiles.last().unwrap().path } else { path },
+                    open: None,
+                },
+            );
+        }
+
+        wfiles
     }
 
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> NineResult<u64> {
-        match self.file {
-            FileInTree::File(ref mut x) => match self.open {
-                Some(ref view) if view.mode.is_readable() => x.borrow_mut().read(offset, buf),
-                _ => panic!(), // TODO: rerror
-            },
-            FileInTree::Dir(ref mut x) => match self.open {
-                Some(ref mut view) if offset == 0 || offset == view.last_offset => {
-                    let len = x.borrow_mut().read(offset, buf)?;
-                    view.last_offset += len;
-                    Ok(len)
+    pub fn open(&mut self, fid: u32, mode: OpenMode) -> Qid {
+        let mut fid = self.fids.get_mut(&fid).expect("bad fid for openin");
+
+        fid.open(&self.user, mode, &mut self.tree.all_files)
+            .unwrap()
+            .qid()
+    }
+
+    pub fn create(&mut self, fid: u32, name: &str, perm: FileMode, mode: OpenMode) -> Qid {
+        let mut fid = self.fids.get_mut(&fid).expect("bad fid for creation");
+
+        let file = fid
+            .create(&self.user.user, name, perm, mode, &mut self.tree)
+            .unwrap();
+
+        file.qid()
+    }
+
+    // TODO: make a type for buf that will let the caller supply it if
+    // they already have a buf, but if not, can let it be lazily allocated
+    // in case of not having the right perms
+    pub fn read(&mut self, fid: u32, offset: u64, buf: &mut [u8]) -> u32 {
+        let fid = self.fids.get_mut(&fid).expect("unknown fid");
+        let path = fid.file;
+
+        if fid.open.is_none() {
+            panic!("fid not open");
+        }
+
+        // if !fid.open.unwrap().is_readable() {
+        //     panic!("fid not open for reading");
+        // }
+
+        let view = fid.open.as_mut().unwrap();
+
+        if self
+            .tree
+            .all_files
+            .get(&path)
+            .expect("unknown path for known fid")
+            .is_dir()
+            && (offset != 0 && offset != view.last_offset)
+        {
+            panic!("bad dir read offset");
+        }
+
+        let amt = self.tree.read(path, offset, buf).expect("read err");
+
+        view.last_offset += amt as u64;
+
+        amt
+    }
+
+    pub fn write(&mut self, fid: u32, offset: u64, data: &[u8]) -> u32 {
+        let fid = self.fids.get(&fid).expect("unknown fid");
+        let path = fid.file;
+
+        if fid.open.is_none() {
+            panic!("fid not open");
+        }
+
+        // if !fid.open.unwrap().is_writable() {
+        //     panic!("fid not open for writing");
+        // }
+
+        self.tree
+            .write(path, &self.user.user, offset, data)
+            .unwrap()
+    }
+
+    pub fn clunk(&mut self, fid: u32) {
+        if let Some(fid) = self.fids.remove(&fid) {
+            if let Some(view) = fid.open {
+                // Whether or not other fids can still use the file is implementation defined
+                if view.mode.contains(OpenMode::CLOSE) {
+                    self.tree.remove(fid.file, &self.user);
                 }
-                _ => {
-                    panic!() // TODO: rerror
-                }
-            },
+            }
+        } else {
+            panic!("Unknown fid for clunk");
         }
     }
 
-    // TODO: make sure we're standards compliant for when permissions are checked
-    fn write(&mut self, user: &str, offset: u64, buf: &[u8]) -> NineResult<u32> {
-        self.is_writable()?;
-
-        self.file.write(user, offset, buf)
+    pub fn remove(&mut self, fid: u32) {
+        if let Some(fid) = self.fids.remove(&fid) {
+            // TODO: correctness with regards to others having it open
+            self.tree.remove(fid.file, &self.user);
+        } else {
+            panic!("Unknown fid for clunk");
+        }
     }
 
-    fn truncate(&mut self, user: &str) -> NineResult<()> {
-        self.file.truncate(user)
+    pub fn stat(&self, fid: u32) -> Stat {
+        let fid = self.fids.get(&fid).expect("unknown fid for stat");
+
+        self.tree.stat(fid.file).expect("unknown path for stat")
+    }
+
+    pub fn wstat(&mut self, fid: u32, wstat: Stat) {
+        let fid = self.fids.get(&fid).expect("unknown fid for wstat");
+
+        self.tree
+            .wstat(fid.file, &self.user.user, wstat)
+            .expect("wstat didn't go so well I guess")
     }
 }

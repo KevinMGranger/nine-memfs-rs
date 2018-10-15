@@ -1,10 +1,18 @@
 [package]
-name = "nine-server"
-version = "0.1.0"
-authors = ["Kevin M Granger"]
+name = "nine-memfs"
+version = "0.2.0"
+description = "A simple in-memory 9p filesystem."
+authors = ["Kevin M Granger <git@kevinmgranger.me>"]
+license = "MPL-2.0"
+readme = "README.md"
+repository = "https://github.com/KevinMGranger/nine-memfs-rs"
+categories = ["filesystem"]
+
+[badges.maintenance]
+status = "experimental"
 
 [dependencies]
-nine = "0.2.*"
+nine = "0.4.*"
 byteorder = "1.1.0"
 bitflags = "1.0.3"
 failure = "0.1.2"
