@@ -1,11 +1,9 @@
-extern crate byteorder;
 extern crate failure;
 extern crate nine;
 
 mod server;
 mod utils;
 
-use byteorder::{LittleEndian, WriteBytesExt};
 use nine::common::MessageTypeId;
 use nine::de::*;
 use nine::p2000::*;
@@ -76,7 +74,7 @@ where
     fn write_msg(&self, mtype: u8, buf: &[u8]) -> io::Result<()> {
         let writer = &mut &self.stream;
         let msize = buf.len() as u32 + 5;
-        writer.write_u32::<LittleEndian>(msize)?;
+        writer.write_all(&msize.to_le_bytes())?;
 
         // println!(
         //     "writing msg of length {} and type {}: {:?}",
@@ -125,6 +123,16 @@ where
         };
 
         println!("{}", quit_msg);
+    }
+
+    fn end_session(&mut self) -> FileTree {
+        if let Some(sess) = self.session.take() {
+            sess.tree
+        } else if let Some(tree) = self.file_tree.take() {
+            tree
+        } else {
+            panic!()
+        }
     }
 
     fn version(&mut self, msg: Tversion) -> NineResult<Rversion> {
@@ -211,7 +219,7 @@ where
 
         Ok(Rread {
             tag: msg.tag,
-            data: Data(vec),
+            data: vec,
         })
     }
 
@@ -315,15 +323,19 @@ fn main() {
 
     let whoami = var("USER").unwrap();
 
+    let mut tree = Some(mktree(whoami.clone()));
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let mut server = Server {
                     stream,
                     session: None,
-                    file_tree: Some(mktree(whoami.clone())),
+                    file_tree: tree.take(),
                 };
                 server.handle_client();
+
+                tree = Some(server.end_session());
             }
             Err(err) => {
                 eprintln!("{}", err);

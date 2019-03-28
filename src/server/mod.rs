@@ -5,7 +5,7 @@ pub use self::errors::*;
 use std::collections::HashSet;
 
 use nine::p2000::*;
-use nine::ser::into_bytes;
+use nine::ser;
 use std::collections::hash_map::HashMap;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::iter::FusedIterator;
@@ -292,8 +292,7 @@ impl FileTree {
                         .iter()
                         .map(|x| self.all_files.get(x).unwrap().stat())
                     {
-                        // TODO: directly into the vec
-                        content.extend(into_bytes(&stat));
+                        ser::into_vec(&stat, &mut content).unwrap();
                     }
 
                     Some(content)
